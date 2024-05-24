@@ -3,24 +3,26 @@
 namespace Smush\Core\Modules;
 
 use Smush\Core\Array_Utils;
-use Smush\Core\Integrations\Mixpanel;
 use Smush\Core\Media_Library\Background_Media_Library_Scanner;
 use Smush\Core\Media_Library\Media_Library_Scan_Background_Process;
 use Smush\Core\Media_Library\Media_Library_Scanner;
 use Smush\Core\Modules\Background\Background_Process;
+use Smush\Core\Modules\Background\Background_Process_Status;
 use Smush\Core\Server_Utils;
 use Smush\Core\Settings;
 use Smush\Core\Stats\Global_Stats;
 use Smush\Core\Webp\Webp_Configuration;
+use Smush\Core\Media\Media_Item_Query;
+use Smush\Core\Helper;
 use WP_Smush;
 use WPMUDEV_Analytics;
 
-class Product_Analytics {
+class Product_Analytics_Controller {
 	const PROJECT_TOKEN = '5d545622e3a040aca63f2089b0e6cae7';
 	/**
-	 * @var Mixpanel
+	 * @var WPMUDEV_Analytics
 	 */
-	private $mixpanel;
+	private $analytics;
 	/**
 	 * @var Settings
 	 */
@@ -63,6 +65,7 @@ class Product_Analytics {
 		add_action( 'wp_smush_directory_smush_start', array( $this, 'track_directory_smush' ) );
 		add_action( 'wp_smush_bulk_smush_start', array( $this, 'track_bulk_smush_start' ) );
 		add_action( 'wp_smush_bulk_smush_completed', array( $this, 'track_bulk_smush_completed' ) );
+		add_action( 'wp_smush_bulk_smush_dead', array( $this, 'track_bulk_smush_background_process_death' ) );
 		add_action( 'wp_smush_config_applied', array( $this, 'track_config_applied' ) );
 		add_action( 'wp_smush_webp_method_changed', array( $this, 'track_webp_method_changed' ) );
 		add_action( 'wp_smush_webp_status_changed', array( $this, 'track_webp_status_changed' ) );
@@ -76,36 +79,38 @@ class Product_Analytics {
 
 		add_action( "{$identifier}_before_start", array( $this, 'record_scan_death' ), 10, 2 );
 		add_action( "{$identifier}_started", array( $this, 'track_background_scan_start' ), 10, 2 );
-		add_action( "{$identifier}_revived", array( $this, 'track_background_scan_revival' ), 10, 2 );
 		add_action( "{$identifier}_completed", array( $this, 'track_background_scan_end' ), 10, 2 );
 
-		add_action(
-			"{$identifier}_cancelled",
-			array( $this, 'track_background_scan_process_cancellation' ),
-			10, 2
-		);
-		add_action(
-			"{$identifier}_dead",
-			array( $this, 'track_background_scan_process_death' ),
-			10, 2
-		);
+		add_action( "{$identifier}_dead", array( $this, 'track_background_scan_process_death' ) );
 
 		add_action( 'wp_smush_plugin_activated', array( $this, 'track_plugin_activation' ) );
 		if ( defined( 'WP_SMUSH_BASENAME' ) ) {
 			$plugin_basename = WP_SMUSH_BASENAME;
 			add_action( "deactivate_{$plugin_basename}", array( $this, 'track_plugin_deactivation' ) );
 		}
+
+		add_action( 'wp_ajax_smush_analytics_track_event', array( $this, 'ajax_handle_track_request' ) );
+	}
+
+	private function track( $event, $properties = array() ) {
+		$debug_mode = defined( 'WP_SMUSH_MIXPANEL_DEBUG' ) && WP_SMUSH_MIXPANEL_DEBUG;
+		if ( $debug_mode ) {
+			Helper::logger()->track()->info( sprintf( 'Track Event %1$s: %2$s', $event, print_r( $properties, true ) ) );
+			return;
+		}
+
+		return $this->get_analytics()->track( $event, $properties );
 	}
 
 	/**
-	 * @return Mixpanel
+	 * @return WPMUDEV_Analytics
 	 */
-	private function get_mixpanel() {
-		if ( is_null( $this->mixpanel ) ) {
-			$this->mixpanel = $this->prepare_mixpanel_instance();
+	private function get_analytics() {
+		if ( is_null( $this->analytics ) ) {
+			$this->analytics = $this->prepare_analytics_instance();
 		}
 
-		return $this->mixpanel;
+		return $this->analytics;
 	}
 
 	public function intercept_settings_update( $old_settings, $settings ) {
@@ -163,7 +168,7 @@ class Product_Analytics {
 		$bulk_properties = array(
 			'Image Sizes'         => empty( $image_sizes ) ? 'All' : 'Custom',
 			'Mode'                => $this->get_current_lossy_level_label(),
-			'Parallel Processing' => defined( 'WP_SMUSH_PARALLEL' ) && WP_SMUSH_PARALLEL ? 'Enabled' : 'Disabled',
+			'Parallel Processing' => $this->get_parallel_processing_status(),
 		);
 		foreach ( $bulk_property_labels as $bulk_setting => $bulk_property_label ) {
 			$property_value                          = Settings::get_instance()->get( $bulk_setting )
@@ -173,6 +178,10 @@ class Product_Analytics {
 		}
 
 		return $bulk_properties;
+	}
+
+	private function get_parallel_processing_status() {
+		return defined( 'WP_SMUSH_PARALLEL' ) && WP_SMUSH_PARALLEL ? 'Enabled' : 'Disabled';
 	}
 
 	private function get_current_lossy_level_label() {
@@ -210,7 +219,7 @@ class Product_Analytics {
 			? 'Feature Activated'
 			: 'Feature Deactivated';
 
-		$this->get_mixpanel()->track( $event, array(
+		$this->track( $event, array(
 			'Feature'        => $feature,
 			'Triggered From' => $this->identify_referrer(),
 		) );
@@ -255,12 +264,12 @@ class Product_Analytics {
 			: $triggered_from[ $page ];
 	}
 
-	private function prepare_mixpanel_instance() {
+	private function prepare_analytics_instance() {
 		if ( ! class_exists( 'WPMUDEV_Analytics' ) ) {
 			require_once WP_SMUSH_DIR . 'core/external/wpmudev-analytics/autoload.php';
 		}
 
-		$mixpanel = new WPMUDEV_Analytics( 'smush', 'Smush', 75, $this->get_token() );
+		$mixpanel = new WPMUDEV_Analytics( 'smush', 'Smush', 55, $this->get_token() );
 		$mixpanel->identify( $this->get_unique_id() );
 		$mixpanel->registerAll( $this->get_super_properties() );
 
@@ -339,7 +348,7 @@ class Product_Analytics {
 		}
 
 		if ( $cdn_properties ) {
-			$this->get_mixpanel()->track( 'CDN Updated', $cdn_properties );
+			$this->track( 'CDN Updated', $cdn_properties );
 
 			return true;
 		}
@@ -357,15 +366,40 @@ class Product_Analytics {
 	}
 
 	public function track_directory_smush() {
-		$this->get_mixpanel()->track( 'Directory Smushed' );
+		$this->track( 'Directory Smushed' );
 	}
 
 	public function track_bulk_smush_start() {
-		$this->get_mixpanel()->track( 'Bulk Smush Started', $this->get_bulk_properties() );
+		$properties = $this->get_bulk_properties();
+		$properties = array_merge(
+			$properties,
+			array(
+				'Background Optimization' => $this->get_background_optimization_status(),
+				'Cron'                    => $this->get_cron_healthy_status(),
+			)
+		);
+		$this->track( 'Bulk Smush Started', $properties );
 	}
 
 	public function track_bulk_smush_completed() {
-		$this->get_mixpanel()->track( 'Bulk Smush Completed', $this->get_bulk_smush_stats() );
+		$properties = $this->get_bulk_smush_stats();
+		$properties = $this->filter_bulk_smush_completed_properties( $properties );
+		$this->track( 'Bulk Smush Completed', $properties );
+	}
+
+	/**
+	 * Add extra properties to the bulk smush completed event for Bulk Smush include ajax method.
+	 *
+	 * @param array $properties Bulk Smush completed properties.
+	 */
+	protected function filter_bulk_smush_completed_properties( $properties ) {
+		return array_merge(
+			$properties,
+			array(
+				'Background Optimization' => $this->get_background_optimization_status(),
+				'Cron'                    => $this->get_cron_healthy_status(),
+			)
+		);
 	}
 
 	private function get_bulk_smush_stats() {
@@ -389,7 +423,7 @@ class Product_Analytics {
 
 		$properties['Triggered From'] = $this->identify_referrer();
 
-		$this->get_mixpanel()->track( 'Config Applied', $properties );
+		$this->track( 'Config Applied', $properties );
 	}
 
 	public function get_unique_id() {
@@ -422,7 +456,7 @@ class Product_Analytics {
 			// @see SMUSH-1538.
 			$location = str_replace( ' ', '_', $this->identify_referrer() );
 			$location = strtolower( $location );
-			$this->get_mixpanel()->track(
+			$this->track(
 				$settings['usage'] ? 'Opt In' : 'Opt Out',
 				array(
 					'Location'       => $location,
@@ -460,14 +494,14 @@ class Product_Analytics {
 			}
 
 			if ( $is_activated ) {
-				$this->get_mixpanel()->track(
+				$this->track(
 					'Integration Activated',
 					array(
 						'Integration' => $integrations[ $integration_slug ],
 					)
 				);
 			} else {
-				$this->get_mixpanel()->track(
+				$this->track(
 					'Integration Deactivated',
 					array(
 						'Integration' => $integrations[ $integration_slug ],
@@ -479,7 +513,7 @@ class Product_Analytics {
 
 	public function intercept_reset() {
 		if ( $this->settings->get( 'usage' ) ) {
-			$this->get_mixpanel()->track(
+			$this->track(
 				'Opt Out',
 				array(
 					'Location'       => 'reset',
@@ -501,16 +535,12 @@ class Product_Analytics {
 		$this->_track_background_scan_start( $type, $background_process );
 	}
 
-	public function track_background_scan_revival( $identifier, $background_process ) {
-		$this->_track_background_scan_start( 'Auto', $background_process );
-	}
-
 	private function _track_background_scan_start( $type, $background_process ) {
 		$properties = array(
 			'Scan Type' => $type,
 		);
 
-		$this->get_mixpanel()->track( 'Scan Started', array_merge(
+		$this->track( 'Scan Started', array_merge(
 			$properties,
 			$this->get_bulk_properties(),
 			$this->get_scan_properties( $background_process )
@@ -527,29 +557,22 @@ class Product_Analytics {
 		$properties = array(
 			'Retry Attempts' => $background_process->get_revival_count(),
 		);
-		$this->get_mixpanel()->track( 'Scan Ended', array_merge(
+		$this->track( 'Scan Ended', array_merge(
 			$properties,
 			$this->get_bulk_properties(),
 			$this->get_scan_properties( $background_process )
 		) );
 	}
 
-	/**
-	 * @param $identifier string
-	 * @param $background_process Background_Process
-	 *
-	 * @return void
-	 */
-	public function track_background_scan_process_cancellation( $identifier, $background_process ) {
-		$properties = array(
-			'Retry Attempts' => $background_process->get_revival_count(),
-			'Slice Size'     => $this->get_scanner_slice_size(),
-		);
-		$this->get_mixpanel()->track(
-			'Background Scan Process Cancelled',
+	public function track_background_scan_process_death() {
+		$this->track(
+			'Background Process Dead',
 			array_merge(
-				$properties,
-				$this->get_background_process_status_properties( $background_process )
+				array(
+					'Process Type' => 'Scan',
+					'Slice Size'   => $this->get_scanner_slice_size(),
+				),
+				$this->get_scan_background_process_properties(),
 			)
 		);
 	}
@@ -560,15 +583,15 @@ class Product_Analytics {
 	 *
 	 * @return void
 	 */
-	public function track_background_scan_process_death( $identifier, $background_process ) {
-		$this->get_mixpanel()->track(
-			'Background Scan Process Dead',
+	public function track_bulk_smush_background_process_death() {
+		$this->track(
+			'Background Process Dead',
 			array_merge(
 				array(
-					'Slice Size'     => $this->get_scanner_slice_size(),
-					'Retry Attempts' => $background_process->get_revival_count(),
+					'Process Type' => 'Smush',
+					'Slice Size'   => 0,
 				),
-				$this->get_background_process_status_properties( $background_process )
+				$this->get_bulk_background_process_properties()
 			)
 		);
 	}
@@ -577,7 +600,6 @@ class Product_Analytics {
 		$global_stats       = Global_Stats::get();
 		$global_stats_array = $global_stats->to_array();
 		$properties         = array(
-			'scan_id'    => $background_process->get_process_id(),
 			'Slice Size' => $this->get_scanner_slice_size(),
 		);
 
@@ -613,24 +635,41 @@ class Product_Analytics {
 		return $properties;
 	}
 
-	/**
-	 * @param Background_Process $background_process
-	 *
-	 * @return array
-	 */
-	private function get_background_process_status_properties( Background_Process $background_process ) {
-		$background_process_status = $background_process ? $background_process->get_status() : false;
-		$properties                = array();
-		if ( $background_process_status ) {
-			$properties = array(
-				'scan_id'         => $background_process->get_process_id(),
-				'Total Items'     => $background_process_status->get_total_items(),
-				'Processed Items' => $background_process_status->get_processed_items(),
-				'Failed Items'    => $background_process_status->get_failed_items(),
-			);
+	private function get_bulk_background_process_properties() {
+		$bg_optimization = WP_Smush::get_instance()->core()->mod->bg_optimization;
+		if ( ! $bg_optimization->is_background_enabled() ) {
+			return array();
 		}
 
-		return $properties;
+		$total_items     = $bg_optimization->get_total_items();
+		$processed_items = $bg_optimization->get_processed_items();
+
+		return array(
+			'Retry Attempts'        => $bg_optimization->get_revival_count(),
+			'Total Enqueued Images' => $total_items,
+			'Completion Percentage' => $this->get_background_process_completion_percentage( $total_items, $processed_items ),
+		);
+	}
+
+	private function get_scan_background_process_properties() {
+		$query                 = new Media_Item_Query();
+		$total_enqueued_images = $query->get_image_attachment_count();
+		$total_items           = $this->scan_background_process->get_status()->get_total_items();
+		$processed_items       = $this->scan_background_process->get_status()->get_processed_items();
+
+		return array(
+			'Retry Attempts'        => $this->scan_background_process->get_revival_count(),
+			'Total Enqueued Images' => $total_enqueued_images,
+			'Completion Percentage' => $this->get_background_process_completion_percentage( $total_items, $processed_items ),
+		);
+	}
+
+	private function get_background_process_completion_percentage( $total_items, $processed_items ) {
+		if ( $total_items < 1 ) {
+			return 0;
+		}
+
+		return ceil( $processed_items * 100 / $total_items );
 	}
 
 	private function convert_to_megabytes( $size_in_bytes ) {
@@ -667,7 +706,7 @@ class Product_Analytics {
 		$direct_conversion_enabled = ! empty( $settings['webp_direct_conversion'] );// WebP method might or might not be changed.
 		$webp_method               = $direct_conversion_enabled ? 'direct' : 'server_redirect';
 		$local_webp_properites     = $this->get_local_webp_properties();
-		$this->get_mixpanel()->track(
+		$this->track(
 			'local_webp_updated',
 			array_merge(
 				$local_webp_properites,
@@ -682,7 +721,7 @@ class Product_Analytics {
 
 	public function track_webp_after_deleting_all_webp_files() {
 		$local_webp_properites = $this->get_local_webp_properties();
-		$this->get_mixpanel()->track(
+		$this->track(
 			'local_webp_updated',
 			array_merge(
 				$local_webp_properites,
@@ -696,7 +735,7 @@ class Product_Analytics {
 
 	public function track_webp_method_changed() {
 		$local_webp_properites = $this->get_local_webp_properties();
-		$this->get_mixpanel()->track(
+		$this->track(
 			'local_webp_updated',
 			array_merge(
 				$local_webp_properites,
@@ -711,7 +750,7 @@ class Product_Analytics {
 	public function track_webp_status_changed() {
 		$local_webp_properites = $this->get_local_webp_properties();
 		$update_type           = $this->settings->is_webp_module_active() ? 'activate' : 'deactivate';
-		$this->get_mixpanel()->track(
+		$this->track(
 			'local_webp_updated',
 			array_merge(
 				$local_webp_properites,
@@ -769,7 +808,7 @@ class Product_Analytics {
 			return;
 		}
 		$local_webp_properites = $this->get_local_webp_properties();
-		$this->get_mixpanel()->track(
+		$this->track(
 			'local_webp_updated',
 			array_merge(
 				$local_webp_properites,
@@ -790,7 +829,7 @@ class Product_Analytics {
 	}
 
 	public function track_plugin_activation() {
-		$this->get_mixpanel()->track(
+		$this->track(
 			'Opt In',
 			array(
 				'Location'       => 'reactivate',
@@ -801,7 +840,7 @@ class Product_Analytics {
 
 	public function track_plugin_deactivation() {
 		$location = $this->get_deactivation_location();
-		$this->get_mixpanel()->track(
+		$this->track(
 			'Opt Out',
 			array(
 				'Location'       => $location,
@@ -817,8 +856,8 @@ class Product_Analytics {
 		}
 
 		$is_dashboard_request = wp_doing_ajax() &&
-								! empty( $_REQUEST['action'] ) &&
-								'wdp-project-deactivate' === wp_unslash( $_REQUEST['action'] );
+		                        ! empty( $_REQUEST['action'] ) &&
+		                        'wdp-project-deactivate' === wp_unslash( $_REQUEST['action'] );
 
 		if ( $is_dashboard_request ) {
 			return 'deactivate_dashboard';
@@ -851,5 +890,109 @@ class Product_Analytics {
 		$plugin_data = get_plugin_data( $plugin_file );
 
 		return ! empty( $plugin_data['Name'] ) ? $plugin_data['Name'] : '';
+	}
+
+	private function get_cron_healthy_status() {
+		return $this->is_cron_healthy() ? 'Enabled' : 'Disabled';
+	}
+
+	private function is_cron_healthy() {
+		$wp_core_cron_hooks = array(
+			'wp_privacy_delete_old_export_files',
+			'wp_version_check',
+			'wp_update_plugins',
+			'wp_update_themes',
+		);
+
+		foreach ( $wp_core_cron_hooks as $hook ) {
+			$next_scheduled_time = wp_next_scheduled( $hook );
+			if ( ! $next_scheduled_time ) {
+				continue;
+			}
+
+			$delayed_time = time() - $next_scheduled_time;
+
+			// If any of the core cron hooks are delayed by more than 30 minutes, then cron is unhealthy.
+			return $delayed_time < ( HOUR_IN_SECONDS / 2 );
+		}
+
+		return false;
+	}
+
+	private function get_background_optimization_status() {
+		$bg_optimization = WP_Smush::get_instance()->core()->mod->bg_optimization;
+		return $bg_optimization->is_background_enabled() ? 'Enabled' : 'Disabled';
+	}
+
+	public function ajax_handle_track_request() {
+		$event_name = $this->get_event_name();
+		if ( ! check_ajax_referer( 'wp-smush-ajax' ) || ! Helper::is_user_allowed() || empty( $event_name ) ) {
+			wp_send_json_error();
+		}
+
+		$this->track(
+			$event_name,
+			$this->get_event_properties( $event_name )
+		);
+
+		wp_send_json_success();
+	}
+
+	private function get_event_name() {
+		return isset( $_POST['event'] ) ? sanitize_text_field( $_POST['event'] ) : '';
+	}
+
+	private function get_event_properties( $event_name ) {
+		$properties = isset( $_POST['properties'] ) ? $_POST['properties'] : array();
+		$properties = array_map( 'sanitize_text_field', $properties );
+
+		$filter_callback = $this->get_filter_properties_callback( $event_name );
+		if ( method_exists( $this, $filter_callback ) ) {
+			$properties = call_user_func( array( $this, $filter_callback ), $properties );
+		}
+
+		return $properties;
+	}
+
+	private function get_filter_properties_callback( $event_name ) {
+		$event_name = str_replace( ' ', '_', $event_name );
+		$event_name = sanitize_key( $event_name );
+		return "filter_{$event_name}_properties";
+	}
+
+	/**
+	 * Filter properties for Scan Interrupted event.
+	 *
+	 * @param array $properties JS properties.
+	 */
+	protected function filter_scan_interrupted_properties( $properties ) {
+		$properties = array_merge(
+			$properties,
+			array(
+				'Slice Size'              => $this->get_scanner_slice_size(),
+				'Background Optimization' => $this->get_background_optimization_status(),
+				'Cron'                    => $this->get_cron_healthy_status(),
+			),
+			$this->get_scan_background_process_properties()
+		);
+
+		return $properties;
+	}
+
+	/**
+	 * Filter properties for Bulk Smush interrupted event.
+	 *
+	 * @param array $properties JS properties.
+	 */
+	protected function filter_bulk_smush_interrupted_properties( $properties ) {
+		return array_merge(
+			$properties,
+			array(
+				'Background Optimization' => $this->get_background_optimization_status(),
+				'Cron'                    => $this->get_cron_healthy_status(),
+				'Parallel Processing'     => $this->get_parallel_processing_status(),
+			),
+			$this->get_bulk_background_process_properties()
+		);
 	}
 }

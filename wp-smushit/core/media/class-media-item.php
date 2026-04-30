@@ -30,7 +30,7 @@ class Media_Item extends Smush_File {
 	/**
 	 * @var string
 	 */
-	private $edit_link;
+	private $edit_url;
 	/**
 	 * @var string
 	 */
@@ -137,9 +137,7 @@ class Media_Item extends Smush_File {
 		$this->id = $id;
 
 		$this->set_settings( Settings::get_instance() );
-		$size_limit = WP_Smush::is_pro()
-			? WP_SMUSH_PREMIUM_MAX_BYTES
-			: WP_SMUSH_MAX_BYTES;
+		$size_limit = WP_SMUSH_MAX_BYTES;
 		$this->set_size_limit( $size_limit );
 		$this->array_utils = new Array_Utils();
 		$this->fs          = new File_System();
@@ -274,15 +272,15 @@ class Media_Item extends Smush_File {
 	 * TODO: use this instead of Helper::get_image_media_link
 	 * @return string
 	 */
-	public function get_edit_link() {
-		if ( is_null( $this->edit_link ) ) {
-			$this->edit_link = $this->prepare_edit_link();
+	public function get_edit_url() {
+		if ( is_null( $this->edit_url ) ) {
+			$this->edit_url = $this->prepare_edit_url();
 		}
 
-		return $this->edit_link;
+		return $this->edit_url;
 	}
 
-	private function prepare_edit_link() {
+	private function prepare_edit_url() {
 		$mode     = get_user_option( 'media_library_mode' );
 		$image_id = $this->get_id();
 		if ( 'grid' === $mode ) {
@@ -292,6 +290,13 @@ class Media_Item extends Smush_File {
 		}
 
 		return $edit_link;
+	}
+
+	public function get_edit_link() {
+		$name = $this->get_full_or_scaled_size()->get_file_name();
+		$url = $this->get_edit_url();
+
+		return "<a href='$url'>$name</a>";
 	}
 
 	/**
